@@ -5,7 +5,6 @@ import copy
 
 from .coco import build as build_coco
 from .vg import build_vg
-from .coco_gpt4sgg import build as build_coco_gpt4sgg
 
 from torch.utils.data import ConcatDataset
 
@@ -29,14 +28,6 @@ def build_dataset(image_set, args):
 
         return build_coco(image_set, args)
 
-    if args.dataset_file == 'coco_gpt4sgg':
-        rln_pretraining = getattr(args, "rln_pretraining", False)
-        if rln_pretraining and image_set != "train":
-            print("*"*10, "visual genome dataset (%s) will be used !" % image_set, "*"*10)
-            return build_vg(image_set, args)
-
-        return build_coco_gpt4sgg(image_set, args)
-        
 
     if args.dataset_file == 'oicap':
         from .oiv6 import build_oicap
@@ -52,15 +43,6 @@ def build_dataset(image_set, args):
     if args.dataset_file == 'vg':
         return build_vg(image_set, args)
 
-    if args.dataset_file == 'cc':
-        from .cc_captions import build_cc
-
-        if image_set == 'train':
-            print("*"*10, "Training dataset will use cc captions !", "*"*10)
-            return build_cc(image_set, args)
-       
-        print("*"*10, "visual genome dataset (%s) will be used !" % image_set, "*"*10)
-        return build_vg(image_set, args)
 
     if args.dataset_file == 'coco_vg':
         coco_data = build_coco(image_set, args)

@@ -53,7 +53,6 @@ Notice that the actual batch size = batch size (default 4 in config files) * num
 ![benchmark on Closed-set SGG](figures/closed-sgg.png)
 
 ### Checkpoints
-
 <!-- insert a table -->
 <table>
   <thead>
@@ -87,7 +86,39 @@ Notice that the actual batch size = batch size (default 4 in config files) * num
 </table> 
 
 ## OvD-SGG 
+for OvD-SGG mode, set ```sg_ovd_mode = True``` in the config file. 
+Following "Towards Open-vocabulary Scene Graph Generation with Prompt-based Finetuning" and [VS3](https://github.com/zyong812/VS3_CVPR23), we split the VG150 into two parts, i.e., 
+base objects ```VG150_BASE_OBJ_CATEGORIES```, and novel objects in ```VG150_NOVEL2BASE```.
+For PREDCLS, please set ```use_gt_box=True``` when calling inference scripts. 
 
+![OvD](figures/OvD.png)
+
+### Checkpoints
+<!-- insert a table -->
+<table>
+  <thead>
+    <tr style="text-align: right;">
+      <th>backbone</th>
+      <th>R@20/50/100</th>
+      <th>Checkpoint</th>
+      <th>Config</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Swin-T</td>
+      <td> 12.34 / 18.14 / 23.20 </td>
+      <td><a href="">link</a></td>
+      <td>config/GroundingDINO_SwinT_OGC_ovd.py</td>
+    </tr>
+    <tr>
+      <td>Swin-B</td>
+      <td>  15.43 / 21.35 / 26.22 </td>
+      <td><a href="">link</a>
+      <td>config/GroundingDINO_SwinB_ovd.py</td>
+    </tr>
+  </tbody>
+</table> 
 
 ## OvR-SGG
 
