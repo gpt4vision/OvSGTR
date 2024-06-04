@@ -1,0 +1,7 @@
+.bak
+.so
+__pycache__
+*.pyc
+.pth
+.pt
+logs
