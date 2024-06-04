@@ -48,7 +48,15 @@ bash scripts/DINO_train_dist.sh vg ./config/GroundingDINO_SwinB_full.py  ./data 
 for using Swin-B backbone.
 you might need to change the default devices of ```CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7```  in the script. 
 Notice that the actual batch size = batch size (default 4 in config files) * num gpus. 
-
+For inference, running with this command
+```
+bash scripts/DINO_eval.sh vg [config file] [data path] [output path] [checkpoint]
+```
+or 
+```
+bash scripts/DINO_eval_dist.sh vg [config file] [data path] [output path] [checkpoint]
+```
+with multiple GPUs (there is a slight difference of the result output by DINO_eval.sh and DINO_eval_dist.sh due to data dividing and gathering). 
 
 ![benchmark on Closed-set SGG](figures/closed-sgg.png)
 
@@ -67,19 +75,19 @@ Notice that the actual batch size = batch size (default 4 in config files) * num
     <tr>
       <td>Swin-T</td>
       <td> 26.97 / 35.82 / 41.38 </td>
-      <td><a href="">link</a></td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-swint-full.pth">link</a></td>
       <td>config/GroundingDINO_SwinT_OGC_full.py</td>
     </tr>
     <tr>
       <td>Swin-B</td>
       <td> 27.75 / 36.44 / 42.35 </td>
-      <td><a href="">link</a>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-swinb-full.pth">link</a>
       <td>config/GroundingDINO_SwinB_full.py </td>
     </tr>
     <tr>
       <td>Swin-B (w.o. frequency bias, focal loss)</td>
-      <td>   </td>
-      <td><a href="">link</a>
+      <td> 27.53 / 36.18 / 41.79  </td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-swinb-full-open.pth">link</a>
       <td>config/GroundingDINO_SwinB_full_open.py </td>
     </tr>
   </tbody>
