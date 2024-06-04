@@ -5,3 +5,8 @@ __pycache__
 .pth
 .pt
 logs
+build
+*egg-info
+*.pth
+*.egg
+dist

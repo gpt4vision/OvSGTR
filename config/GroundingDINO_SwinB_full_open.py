@@ -97,7 +97,6 @@ num_rln_cat = 51
 num_rln_queries = 1
 edge_loss_coef = 1.0
 
-rln_add_coords = True
 
 sgg_mode = 'full_open'
 
@@ -106,7 +105,3 @@ focal_loss_for_edges = True
 
 
 detections_per_img = 100
-
-
-#data_aug_max_size=1000
-#data_aug_scales = [480, 496, 512, 536, 552, 576, 600]

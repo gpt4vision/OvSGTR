@@ -1,0 +1,1247 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
+                       accuracy, get_world_size, interpolate,
+                       is_dist_avail_and_initialized)
+
+from util import box_ops
+from .utils import sigmoid_focal_loss   
+
+from scipy.optimize import linear_sum_assignment
+
+import os
+import copy
+
+from torchvision.ops import roi_pool
+
+from .matcher import search_query_pos
+
+import math
+import numpy as np
+import random
+import bisect
+
+import cv2
+
+    
+def padding_last(logits, max_len=2048):
+    logits_pad = torch.full((*logits.shape[:-1], max_len), 
+                               float("-inf"), device=logits.device)
+    logits_pad[..., : logits.shape[-1]] = logits
+
+    return logits_pad
+
+def shrink_sigmoid(x, scale=1.):
+    return 1.0 / (1.0 + torch.exp(-scale * x))
+
+
+class SetCriterion(nn.Module):
+    """ This class computes the loss for Conditional DETR.
+    The process happens in two steps:
+        1) we compute hungarian assignment between ground truth boxes and the outputs of the model
+        2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
+    """
+    def __init__(self,  matcher, weight_dict, focal_alpha, losses, 
+                **kwargs):
+        """ Create the criterion.
+        Parameters:
+            num_classes: number of object categories, omitting the special no-object category
+            matcher: module able to compute a matching between targets and proposals
+            weight_dict: dict containing as key the names of the losses and as values their relative weight.
+            losses: list of all the losses to be applied. See get_loss for list of available losses.
+            focal_alpha: alpha in Focal Loss
+        """
+        super().__init__()
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        self.losses = losses
+        self.focal_alpha = focal_alpha
+        self.focal_loss_for_edges = kwargs.get("focal_loss_for_edges", False)
+
+        self.rln_proj = kwargs.get("rln_proj", None)
+        self.rln_proj_teacher = kwargs.get("rln_proj_teacher", None)
+        self.rln_classifier = kwargs.get("rln_classifier", None)
+        self.rln_freq_bias = kwargs.get("rln_freq_bias", None)
+
+
+        self.rln_pretraining = kwargs.get("rln_pretraining", False)
+        self.tokenizer = kwargs.get("tokenizer", None)
+        self.ind_to_predicates = kwargs.get("ind_to_predicates", None)
+        self.use_objectness = False 
+        self.global_iter = -1
+        hidden_dim = kwargs.get("hidden_dim", 256)
+        self.min_obj=-hidden_dim*math.log(0.9)
+        self.obj_temp = kwargs.get("obj_temp", 1.3 / hidden_dim)
+        self.obj_start_iter = kwargs.get("obj_start_iter", 1000)
+        self.obj_threshold = kwargs.get("obj_threshold", 0.5)
+
+
+    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+        """Classification loss (Binary focal loss)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'pred_logits' in outputs
+        idx = self._get_src_permutation_idx(indices)
+
+        src_logits = outputs['pred_logits'] # (bsz, num_queries, 256)
+        src_mask = src_logits == float('-inf')
+        # 
+        tgt_pos_seg = []
+        for bid, (target, (_, J)) in enumerate(zip(targets, indices)):
+            gt_names = target['gt_names']
+            all_ids = target['input_ids']
+            pos_seg = []
+            for name in gt_names:
+                ids = self.tokenizer(name +'.').input_ids[1:-1]
+                start_i, end_i = search_query_pos(all_ids.tolist(), ids)
+                assert start_i != end_i, "cannot find query:{} from input_ids:{}".format(ids,
+                                self.tokenizer.decode(all_ids))
+                pos_seg.append((start_i, end_i))
+
+            for j in J.tolist():
+                tgt_pos_seg.append(pos_seg[j])
+
+
+        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2]+1],
+                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
+
+
+        # set positive labels
+        for bid, qid, seg in zip(idx[0], idx[1], tgt_pos_seg):
+            target_classes_onehot[bid, qid, seg[0]:seg[1]].fill_(1.0)
+
+        target_classes_onehot = target_classes_onehot[:,:,:-1]
+
+        alpha = self.focal_alpha
+        gamma = 2.0
+
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, 
+                                     alpha=alpha, gamma=gamma, reduction='none') * src_logits.shape[1]
+        loss_ce.masked_fill_(src_mask, 0.)
+
+        nb_pos = target_classes_onehot.sum(-1)
+        nb_pos[nb_pos == 0] = 1.0
+
+        loss_ce = (loss_ce / nb_pos.unsqueeze(2)).mean(1).sum() / num_boxes
+        losses = {'loss_ce': loss_ce}
+
+
+        return losses
+
+
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(src_boxes),
+            box_ops.box_cxcywh_to_xyxy(target_boxes)))
+
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
+
+        ## calculate the x,y and h,w loss
+        #with torch.no_grad():
+        #    losses['loss_xy'] = loss_bbox[..., :2].sum() / num_boxes
+        #    losses['loss_hw'] = loss_bbox[..., 2:].sum() / num_boxes
+
+        return losses
+
+    def loss_masks(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the masks: the focal loss and the dice loss.
+           targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
+        """
+        assert "pred_masks" in outputs
+
+        src_idx = self._get_src_permutation_idx(indices)
+        tgt_idx = self._get_tgt_permutation_idx(indices)
+        src_masks = outputs["pred_masks"]
+        src_masks = src_masks[src_idx]
+        masks = [t["masks"] for t in targets]
+        # TODO use valid to mask invalid areas due to padding in loss
+        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
+        target_masks = target_masks.to(src_masks)
+        target_masks = target_masks[tgt_idx]
+
+        # upsample predictions to the target size
+        src_masks = interpolate(src_masks[:, None], size=target_masks.shape[-2:],
+                                mode="bilinear", align_corners=False)
+        src_masks = src_masks[:, 0].flatten(1)
+
+        target_masks = target_masks.flatten(1)
+        target_masks = target_masks.view(src_masks.shape)
+        losses = {
+            "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes),
+            "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
+        }
+        return losses
+
+    def _get_src_permutation_idx(self, indices):
+        # permute predictions following indices
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def _get_tgt_permutation_idx(self, indices):
+        # permute targets following indices
+        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
+        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+        return batch_idx, tgt_idx
+
+    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+        loss_map = {
+            'labels': self.loss_labels,
+            'boxes': self.loss_boxes,
+            'masks': self.loss_masks,
+            'edges': self.loss_edges,
+            'obj_likelihood': self.loss_obj_likelihood,
+        }
+        assert loss in loss_map, f'do you really want to compute {loss} loss?'
+        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+
+    def loss_obj_likelihood(self, outputs, targets, indices, num_boxes):
+        assert "pred_obj" in outputs, "pred_obj does not exist in outputs, outputs.keys:{}".format(outputs.keys())
+
+        idx = self._get_src_permutation_idx(indices)
+        pred_obj = outputs["pred_obj"][idx]
+        return  {'loss_obj_ll': torch.clamp(pred_obj, min=self.min_obj).sum()/ num_boxes}
+
+    @torch.no_grad()
+    def get_objectness(self, pred_obj):
+        return torch.exp(-self.obj_temp*pred_obj)
+
+    def loss_edges(self, outputs, targets, indices, num_boxes,
+                   object_token, relation_token, rel_text_dict, 
+                   rel_text_dict_t=None, outputs_t=None, indices_t=None):
+        """
+          compute loss for relations 
+        """
+        device = outputs['pred_logits'].device
+        bs, num_queries = outputs['pred_logits'].shape[:2]
+        relation_wo_labels = 'edges' not in targets[0]
+        relation_feature_t = None
+        extra_nodes = []
+
+        # if use_objectness is True, we choose GT nodes & predicted nodes with high confidence to constrcut 
+        # a more denser graph than annotated graph. 
+        if self.use_objectness and 'pred_obj' in outputs and self.global_iter > self.obj_start_iter: #
+            node_objs = self.get_objectness(outputs['pred_obj']) # B*N
+            for bid in range(len(targets)):
+                src_id = indices[bid][0]
+
+                node_proposal = torch.where(node_objs[bid] > self.obj_threshold)[0].to(src_id.device)
+                if len(node_proposal) <= 0:
+                    extra_nodes.append(None)
+                    continue 
+
+                node_proposal = node_proposal[(node_proposal.view(1, -1) != src_id.view(-1, 1)).all(dim=0)]
+
+                src_id_t = indices_t[bid][0]
+                tmp = list(set(range(outputs_t['pred_boxes'].shape[1])) - set(src_id_t.tolist()))
+                tmp = torch.as_tensor(tmp)
+
+                out_bbox = outputs_t['pred_boxes'][bid, tmp]
+                tgt_bbox = outputs['pred_boxes'][bid, node_proposal]
+                src_hs = outputs_t['hs_obj'][bid, tmp]
+                dst_hs = outputs['hs_obj'][bid, node_proposal]
+
+                with torch.no_grad():
+                    cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+                    cost_giou = -box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(out_bbox), 
+                                                             box_ops.box_cxcywh_to_xyxy(tgt_bbox))
+                    cost_class =  torch.cdist(src_hs, dst_hs, p=1)
+                    cost_mat = self.matcher.cost_bbox * cost_bbox + self.matcher.cost_class * cost_class + self.matcher.cost_giou * cost_giou
+
+                indice_st = linear_sum_assignment(cost_mat.cpu())
+
+                node_proposal = node_proposal[indice_st[1]]
+                node_proposal_t = tmp[indice_st[0]]
+
+                extra_nodes.append((node_proposal, node_proposal_t))
+
+        if self.use_objectness and 'backbone_feat' in outputs:
+            bk_feats = outputs['backbone_feat'].mean(1, keepdim=True) # N, 1, H, W
+            ih, iw = outputs['input_size']
+
+            node_proposals = []
+            for bid, target in enumerate(targets):
+                ih, iw = target['size']
+                ih = ih // 4
+                iw = iw // 4
+                scale_fct = torch.as_tensor([iw, ih, iw, ih], dtype=torch.float32).to(bk_feats.device)
+
+                boxes = box_ops.box_cxcywh_to_xyxy(outputs['pred_boxes'][bid]) * scale_fct  # N*900*4
+                bk_feat = F.interpolate(bk_feats[bid].unsqueeze(0), size=(ih, iw), 
+                                        mode='bilinear', align_corners=True)
+
+                att_scores = roi_pool(bk_feat, [boxes], output_size=1).squeeze()
+
+                cur_node = indices[bid][0]
+                att_scores[cur_node] = float('-inf')
+                _, topk_inds = att_scores.topk(5)
+                node_proposals.append(topk_inds)
+
+            node_proposals = torch.stack(node_proposals)
+
+            tgt_bbox = torch.gather(outputs['pred_boxes'], 1, node_proposals.unsqueeze(-1).repeat(1, 1, 4)).flatten(0, 1)
+            tgt_hs = torch.gather(outputs['hs_obj'], 1, node_proposals.unsqueeze(-1).repeat(1, 1, outputs['hs_obj'].shape[-1])).flatten(0, 1)
+
+            mask = torch.ones(outputs_t['pred_boxes'].shape[0], outputs_t['pred_boxes'].shape[1])
+
+            for bid in range(len(targets)):
+                src_id_t = indices_t[bid][0]
+                mask[bid, src_id_t] = 0
+
+            src_bbox = outputs_t['pred_boxes'].flatten(0, 1)
+            src_hs = outputs_t['hs_obj'].flatten(0, 1)
+
+            with torch.no_grad():
+                cost_bbox = torch.cdist(src_bbox, tgt_bbox, p=1)
+                cost_giou = -box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(src_bbox), 
+                                                         box_ops.box_cxcywh_to_xyxy(tgt_bbox))
+                cost_class =  torch.cdist(src_hs, tgt_hs, p=1)
+                cost_mat = self.matcher.cost_bbox * cost_bbox + self.matcher.cost_class * cost_class + self.matcher.cost_giou * cost_giou
+            bsz = outputs['pred_boxes'].shape[0]
+            num_quries = outputs['pred_boxes'].shape[1]
+            cost_mat = cost_mat.view(bsz, num_quries, -1)
+            cost_mat[mask==0] = 1e10
+            cost_mat = cost_mat.cpu()
+
+            sizes = [node_proposals.shape[-1] for _ in range(node_proposals.shape[0])]
+            indice_st = [linear_sum_assignment(c[i]) for i, c in enumerate(cost_mat.split(sizes, -1))]
+
+            extra_nodes = [(node_proposals[bid][ist[1]], torch.as_tensor(ist[0])) for bid, ist in enumerate(indice_st)]
+            if os.environ.get("DEBUG") == '2':
+                import matplotlib.pyplot as plt
+
+                for bid in range(len(targets)):
+                    img = outputs['raw_images'][bid].permute(1, 2, 0).cpu().contiguous()*255.0
+                    img1  = np.uint8(img.clone().numpy())
+                    img2  = np.uint8(img.clone().numpy())
+                    cur_node = indices[bid][0]
+
+                    ih, iw = targets[bid]['size']
+                    scale_fct = torch.as_tensor([iw, ih, iw, ih], dtype=torch.float32).to(bk_feats.device)
+                    boxes = box_ops.box_cxcywh_to_xyxy(outputs['pred_boxes'][bid]) * scale_fct  # N*900*4
+                    
+                    for node in cur_node.tolist():
+                        box = boxes[node] 
+                        x0, y0 = int(box[0]), int(box[1])
+                        x1, y1 = int(box[2]), int(box[3])
+                        color = np.random.randint(0, 255, size=(3, ))
+                        color = ( int (color [ 0 ]), int (color [ 1 ]), int (color [ 2 ]))
+                        cv2.rectangle(img1, (x0, y0), (x1, y1), color, 5)
+
+                    for node in node_proposals[bid].tolist():
+                        box = boxes[node]
+                        x0, y0 = int(box[0]), int(box[1])
+                        x1, y1 = int(box[2]), int(box[3])
+                        color =np.random.randint(0, 255, size=(3, ))
+                        color = ( int (color [ 0 ]), int (color [ 1 ]), int (color [ 2 ]))
+                        cv2.rectangle(img2, (x0, y0), (x1, y1), color, 5)
+
+                    plt.subplot(221)
+                    plt.imshow(np.uint8(img))
+                    plt.title("Orig. image")
+                    plt.subplot(222)
+                    plt.imshow(bk_feats[bid, 0].cpu())
+                    plt.title("heatmap")
+                    plt.subplot(223)
+                    plt.imshow(img1)
+                    plt.title("GT boxes")
+                    plt.subplot(224)
+                    plt.imshow(img2)
+                    plt.title("selected boxes")
+
+                    plt.savefig("att.jpg")
+                    import pdb; pdb.set_trace()
+
+
+        if not relation_wo_labels: # 
+            all_edge_lbl = []
+            freq_dist = []
+            batch_ids = []
+
+            sid, oid = [], []
+            s_labels, o_labels = [], []
+            sid_t, oid_t = [], []
+            for bid, target in enumerate(targets):
+                tgt_edges = target['edges']
+                if len(tgt_edges) == 0:
+                    continue 
+                
+                matched = {}
+                for src, dst in zip(indices[bid][0].tolist(), indices[bid][1].tolist()):
+                    matched[dst] = src
+
+                if len(extra_nodes) > 0 and extra_nodes[bid] is not None:
+                    shift = len(matched)
+                    for ii in range(extra_nodes[bid][0].shape[0]):
+                        matched[ii+shift] = extra_nodes[bid][0][ii].item()
+
+                num_pos = num_total = 0
+                n = len(matched)
+                full_adj = torch.ones((n,n))-torch.diag(torch.ones(n))
+
+                if outputs_t is not None:
+                    matched_t = {}
+                    for src, dst in zip(indices_t[bid][0].tolist(), indices_t[bid][1].tolist()):
+                        matched_t[dst] = src
+
+                    if len(extra_nodes) > 0 and extra_nodes[bid] is not None:
+                        shift = len(matched_t)
+                        for ii in range(extra_nodes[bid][1].shape[0]):
+                            matched_t[ii+shift] = extra_nodes[bid][1][ii].item()
+                
+                for edge in tgt_edges.tolist():
+                    if edge[0] in matched and edge[1] in matched:
+                        sid.append([bid, matched[edge[0]]])
+                        oid.append([bid, matched[edge[1]]])
+                        all_edge_lbl.append(edge[2])
+
+                        num_pos += 1
+                        full_adj[edge[0], edge[1]] = 0
+
+                        s_labels.append(target['labels'][edge[0]])
+                        o_labels.append(target['labels'][edge[1]])
+
+                        if outputs_t is not None:
+                            sid_t.append([bid, matched_t[edge[0]]])
+                            oid_t.append([bid, matched_t[edge[1]]])
+
+                # negatives 
+                neg_edges = torch.nonzero(full_adj)
+                num_neg_per_img = max(1, num_pos * 3)
+                if len(neg_edges) >= num_neg_per_img:
+                    if outputs_t is not None:
+                        # sample
+                        hs_obj_t = outputs_t['hs_obj'][bid]
+                        nsid, noid = [], []
+                        for edge in neg_edges.tolist():
+                            nsid.append(matched_t[edge[0]])
+                            noid.append(matched_t[edge[1]])
+                        nsid = torch.as_tensor(nsid)
+                        noid = torch.as_tensor(noid)
+                        
+                        feat = torch.cat((hs_obj_t[nsid], hs_obj_t[noid],
+                                          outputs_t['hs_rln'][bid].flatten(1).repeat(nsid.shape[0], 1)),
+                                          1)
+                        with torch.no_grad():
+                            feat = self.rln_proj_teacher(feat)
+
+                        encoded_text = rel_text_dict_t['encoded_text'][bid]
+                        feat = feat @ encoded_text.T
+
+                        keep = feat.max(-1)[0].topk(num_neg_per_img)[1]
+                        neg_edges = neg_edges[keep]
+                    else:
+                        idx_ = torch.randperm(neg_edges.shape[0])[:num_neg_per_img]
+                        neg_edges = neg_edges[idx_,:]
+                
+                for edge in neg_edges.tolist():
+                    sid.append([bid, matched[edge[0]]])
+                    oid.append([bid, matched[edge[1]]])
+
+                    if self.rln_freq_bias is not None:
+                        s_labels.append(target['labels'][edge[0]])
+                        o_labels.append(target['labels'][edge[1]])
+
+                    all_edge_lbl.append(0)
+                    num_total += 1
+                    if outputs_t is not None:
+                        sid_t.append([bid, matched_t[edge[0]]])
+                        oid_t.append([bid, matched_t[edge[1]]])
+
+                num_total += num_pos
+                batch_ids.extend([bid] * num_total)
+
+            sid = torch.as_tensor(sid)
+            oid = torch.as_tensor(oid)
+            all_edge_lbl = torch.as_tensor(all_edge_lbl)
+            batch_ids = torch.as_tensor(batch_ids)
+            relation_feature = torch.cat((object_token[sid[:, 0], sid[:, 1]],
+                                 object_token[oid[:, 0], oid[:, 1]],
+                                 relation_token[batch_ids].flatten(1)), 1)
+
+            if self.rln_freq_bias is not None:
+                s_labels = torch.as_tensor(s_labels).to(object_token.device)
+                o_labels = torch.as_tensor(o_labels).to(object_token.device)
+                freq_dist.append(self.rln_freq_bias( \
+                            torch.stack((s_labels, o_labels), 1)
+                        ))
+            if outputs_t is not None:
+                sid_t = torch.as_tensor(sid_t)
+                oid_t = torch.as_tensor(oid_t)
+
+                relation_feature_t = torch.cat((outputs_t['hs_obj'][sid_t[:, 0], sid_t[:, 1]],
+                                                outputs_t['hs_obj'][oid_t[:, 0], oid_t[:, 1]],
+                                                outputs_t['hs_rln'][batch_ids].flatten(1)), 1)
+
+            """
+            target_boxes = [v['boxes'] for v in targets]
+            target_labels = [v['labels'] for v in targets]
+            target_edges = [v['edges'] for v in targets]
+            target_edges = [[t for t in tgt if t[0].cpu() in dst and t[1].cpu() in dst] 
+                              for tgt, (_, dst) in zip(target_edges, indices)]
+            target_edges = [torch.stack(t, 0) if len(t)>0 else torch.zeros((0,3), dtype=torch.long).to(device) 
+                                for t in target_edges]
+            rel_labels = [t[:,2] for t in target_edges]
+            target_edges = [t[:,:2] for t in target_edges]
+
+            filtered_edges = []
+            for t, (_, i) in zip(target_edges, indices):
+                if t.shape[0]>0:
+                    tx = t.detach().clone()
+                    for idx, k in enumerate(i):
+                        t[tx==k]=idx
+                filtered_edges.append(t)
+
+            batch_ids = []
+            relation_feature = []
+            all_edge_lbl = []
+            for b_id, (filtered_edge, rel_label, n, t_lbl) in enumerate(zip(filtered_edges, rel_labels, 
+                                                                            target_boxes, target_labels)):
+                if len(filtered_edge) == 0:
+                    continue 
+    
+                # find the -ve edges for training
+                full_adj = torch.ones((n.shape[0],n.shape[0]))-torch.diag(torch.ones(n.shape[0]))
+                full_adj[filtered_edge[:,0], filtered_edge[:,1]]=0
+                neg_edges = torch.nonzero(full_adj).to(filtered_edge.device)
+
+                # pos:neg = 1:3
+                num_neg_per_img = max(1, len(filtered_edge) * 3)
+                if len(neg_edges) >= num_neg_per_img:
+                    idx_ = torch.randperm(neg_edges.shape[0])[:num_neg_per_img]
+                    neg_edges = neg_edges[idx_,:]
+                else:
+                    # should we sample cross frames ? 
+                    pass
+
+                all_edges_ = torch.cat((filtered_edge, neg_edges), 0)
+                edge_labels = torch.cat((rel_label.to(object_token.device), 
+                                         torch.zeros(neg_edges.shape[0], dtype=torch.long, device=object_token.device)), 0)
+
+                
+                all_edge_lbl.append(edge_labels)
+            
+
+                # get the valid predicted matching
+                pred_ids = indices[b_id][0]
+                joint_emb = object_token[b_id, pred_ids, :]
+
+                sub_feat = joint_emb[all_edges_[:,0],:]
+                obj_feat = joint_emb[all_edges_[:,1],:]
+
+                if self.rln_freq_bias is not None:
+                    target_class = t_lbl[indices[b_id][1]]
+                    freq_dist.append(self.rln_freq_bias( \
+                        torch.stack((target_class[all_edges_[:, 0]],  \
+                                     target_class[all_edges_[:, 1]]), 1)))
+
+                relation_feature.append(torch.cat((
+                                                    sub_feat, obj_feat,
+                                                    relation_token[b_id].flatten().repeat(all_edges_.shape[0],1),
+                                                  ), 1))
+
+                batch_ids.append(torch.ones(len(sub_feat), dtype=torch.long) * b_id)
+
+            relation_feature = torch.cat(relation_feature, 0)
+            all_edge_lbl = torch.cat(all_edge_lbl, 0).to(object_token.device)
+            batch_ids = torch.cat(batch_ids)
+            """
+        else: # open-set
+            rel_tgt = []
+            batch_ids = []
+            sid, oid = [], []
+
+            for bid, target in enumerate(targets):
+                if len(target['relations']) == 0:
+                    continue
+
+                grounded = {}
+                cur_num = 0
+                for src, dst in zip(indices[bid][0], indices[bid][1]):
+                    grounded[dst.item()] = src.item()
+
+                q_nouns = target['gt_names']
+                for rel in target['relations']:
+                    if rel[0] not in q_nouns or rel[1] not in q_nouns:
+                        continue 
+                    si = q_nouns.index(rel[0])
+                    oi = q_nouns.index(rel[1])
+
+                    rel_tgt.append(rel[2])
+                    sid.append([bid, grounded[si]])
+                    oid.append([bid, grounded[oi]])
+                    cur_num += 1
+                    
+                # random sample negatives
+                n = len(q_nouns)
+                full_adj = torch.ones((n, n))-torch.diag(torch.ones(n))
+                for rel in target['relations']:
+                    if rel[0] not in q_nouns or rel[1] not in q_nouns:
+                        continue 
+                    si = q_nouns.index(rel[0])
+                    oi = q_nouns.index(rel[1])
+                    full_adj[si, oi] = 0
+                neg_edges = torch.nonzero(full_adj)
+
+                num_neg_per_img = max(1, len(target['relations']) * 3)
+                if len(neg_edges) >= num_neg_per_img:
+                    idx_ = torch.randperm(neg_edges.shape[0])[:num_neg_per_img]
+                    neg_edges = neg_edges[idx_,:]
+
+                for item in neg_edges.tolist():
+                    sid.append([bid, grounded[item[0]]])
+                    oid.append([bid, grounded[item[1]]])
+                    rel_tgt.append('[UNK]')
+                    cur_num += 1
+
+                # random sampling from other images in a batch 
+                if len(neg_edges) < num_neg_per_img: 
+                    for rel in target['relations']:
+                        if rel[0] not in q_nouns or rel[1] not in q_nouns:
+                            continue 
+                        si = q_nouns.index(rel[0])
+                        oi = q_nouns.index(rel[1])
+
+                        next_id = bid
+                        assert len(targets) > 1, "batch size must be greather than 1!"
+                        while next_id == bid:
+                            next_id = random.randint(0, len(targets)-1)
+
+                        rid = random.randint(0, object_token.shape[1]-1)
+                        if random.randint(0, 1) == 0:
+                            sid.append([bid, grounded[si]])
+                            oid.append([next_id,  rid])
+                        else:
+                            sid.append([next_id, rid])
+                            oid.append([bid, grounded[oi]])
+
+                        rel_tgt.append('[UNK]')
+                        cur_num += 1
+
+                batch_ids.extend([bid] * cur_num)
+
+            batch_ids = torch.as_tensor(batch_ids)
+            sid = torch.as_tensor(sid)
+            oid = torch.as_tensor(oid)
+            relation_feature = torch.cat((object_token[sid[:, 0], sid[:, 1]],
+                                          object_token[oid[:, 0], oid[:, 1]],
+                                          relation_token[batch_ids].flatten(1)
+                                          ), 1)
+
+        assert len(relation_feature) > 0, "No relation features !"
+
+        # random permute
+        _idx_ = torch.randperm(len(relation_feature))
+        batch_ids = batch_ids[_idx_]
+        relation_feature = relation_feature[_idx_]
+        relation_feature = self.rln_proj(relation_feature)
+        if relation_feature_t is not None:
+            with torch.no_grad():
+                relation_feature_t = self.rln_proj_teacher(relation_feature_t[_idx_])
+
+        if not relation_wo_labels:
+            all_edge_lbl = all_edge_lbl[_idx_]
+        else:
+            rel_tgt = [rel_tgt[e] for e in _idx_.tolist()]
+
+        # loss 
+        if self.rln_classifier is not None:
+            assert not relation_wo_labels, "rln_classifier should be None for open vocabulary !"
+            rel_logits = self.rln_classifier(relation_feature)
+            if self.rln_freq_bias is not None:
+                freq_dist = torch.cat(freq_dist, 0)[_idx_]
+                rel_logits += freq_dist
+
+
+
+            rel_tgt_onehot = torch.zeros([rel_logits.shape[0], rel_logits.shape[1]],
+                                          dtype =rel_logits.dtype, 
+                                          layout=rel_logits.layout, 
+                                          device=rel_logits.device)
+
+            all_edge_lbl = all_edge_lbl.to(rel_logits.device)
+            rel_tgt_onehot.scatter_(-1, all_edge_lbl.unsqueeze(-1), 1)
+        else:
+            encoded_text = rel_text_dict['encoded_text'][batch_ids]
+            text_mask = rel_text_dict['text_token_mask'][batch_ids]
+            input_ids = rel_text_dict['input_ids'][batch_ids]
+
+
+            rel_logits  = torch.einsum("a d, a b d -> a b", relation_feature, encoded_text)
+            rel_logits.masked_fill_(~text_mask, float('-inf'))
+            # padding to max_text_len
+            rel_logits = padding_last(rel_logits, 512) # 512 ? 2048
+            rel_tgt_onehot = torch.zeros_like(rel_logits)
+
+            if relation_feature_t is not None:
+                encoded_text_t = rel_text_dict_t['encoded_text'][batch_ids]
+                rel_logits_t  = torch.einsum("a d, a b d -> a b", relation_feature_t, encoded_text_t)
+                rel_logits_t.masked_fill_(~text_mask, float('-inf'))
+                rel_logits_t = padding_last(rel_logits_t, rel_logits.shape[-1])
+
+                rel_logits_t = shrink_sigmoid(rel_logits_t, 2.0)
+                #rel_logits_t.sigmoid_()
+
+            if relation_wo_labels:
+                for ii, name in enumerate(rel_tgt):
+                    if name == '[UNK]':
+                        continue 
+
+                    ids = self.tokenizer(name + '.').input_ids[1:-1]
+                    all_ids = input_ids[ii]
+
+                    start_i, end_i = search_query_pos(all_ids.tolist(), ids)
+                    assert start_i != end_i, "cannot find query:{} from input_ids: {}".format(
+                            name, self.tokenizer.decode(all_ids))
+
+                    rel_tgt_onehot[ii, start_i: end_i] = 1.0
+
+            else:
+                for ii, label in enumerate(all_edge_lbl.tolist()):
+                    name = self.ind_to_predicates[label]
+                    if name == '[UNK]' and relation_feature_t is not None: # use teacher's output
+                        rel_tgt_onehot[ii] = rel_logits_t[ii]
+                        continue 
+
+                    if name == '[UNK]':
+                        continue 
+
+                    ids = self.tokenizer(name +'.').input_ids[1:-1]
+                    all_ids = input_ids[ii]
+                    start_i, end_i = search_query_pos(all_ids.tolist(), ids)
+                    assert start_i != end_i, "cannot find query:{} from input_ids".format(ids)
+
+                    rel_tgt_onehot[ii, start_i: end_i] = 1.0
+
+
+
+        rel_num = torch.as_tensor(rel_tgt_onehot.shape[0], device=rel_tgt_onehot.device) 
+        #rel_num = rel_tgt_onehot.sum()
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(rel_num)
+        rel_num = torch.clamp(rel_num / get_world_size(), min=1).item()
+
+                
+        if not self.focal_loss_for_edges:  # CE
+            loss = F.cross_entropy(rel_logits, all_edge_lbl, reduction='sum') / rel_num
+            losses = dict(loss_edges=loss)
+        else: # focal loss
+            alpha, gamma = 0.25, 2.0
+            eps = 1e-5 
+            rel_prob = rel_logits.sigmoid().clamp(min=eps, max=1.0-eps)
+            rel_mask = (rel_logits != float('-inf')).float()
+          
+            rel_weight = (rel_tgt_onehot > 0.5).sum(1, keepdim=True)
+            rel_weight[rel_weight == 0] = 1.0
+
+            pos_loss = - torch.log(rel_prob) * ((1.0 - rel_prob)** gamma) * rel_tgt_onehot * rel_mask / rel_weight
+            neg_loss = - torch.log(1.0 -rel_prob) * (rel_prob**gamma) * (1.0 - rel_tgt_onehot) * rel_mask  / rel_weight
+
+            pos_loss = pos_loss.sum() 
+            neg_loss = neg_loss.sum() 
+
+            loss = (pos_loss + neg_loss) / rel_num
+
+            losses = dict(loss_edges=loss)
+            with torch.no_grad():
+                losses['loss_edges_pos'] = pos_loss.detach() /  rel_num
+                losses['loss_edges_neg'] = neg_loss.detach() /  rel_num
+
+
+        losses['rel_batch'] = torch.as_tensor(rel_num).to(losses['loss_edges'].device)
+        if os.environ.get("DEBUG") == '1':
+            import pdb; pdb.set_trace()
+
+        return losses
+
+    def _focal_loss(self, logits, tgt_onehot, gamma=2.0, eps=1e-5):
+        prob = logits.sigmoid().clamp(min=eps, max=1.0-eps)
+        mask = (logits != float('-inf')).float()
+
+        pos_loss = -torch.log(prob) * torch.pow(1.0 - prob, gamma) * tgt_onehot * mask
+        neg_loss = -torch.log(1.0-prob) * torch.pow(prob, gamma) * (1 - tgt_onehot) * mask
+
+        num_pos = tgt_onehot.sum()
+        if num_pos == 0:
+            return neg_loss.sum()
+
+        loss = (pos_loss.sum() + neg_loss.sum()) / num_pos
+
+        return loss
+
+    def rln_set_loss(self, outputs, targets, rel_text_dict):
+        hs_obj = outputs['hs_obj'] #(bsz, N, dim)
+        hs_rln = outputs['hs_rln'] # (bsz, M, dim)
+
+        pred_logits = outputs['pred_logits'] # (bsz, num, m+pad)
+        encoded_text = rel_text_dict['encoded_text'] # (bsz, m, d)
+        text_mask = rel_text_dict['text_token_mask'] # (bsz, m)
+
+        # step 1 -- grounding 
+        grounded = []
+        obj_logits , obj_tgt_onehot = [], []
+        pad_len = 2048
+
+        with torch.no_grad():
+            for bid, target in enumerate(targets):
+                if len(target['relations']) == 0:
+                    grounded.append(None)
+                    continue 
+
+                input_ids = target['input_ids'].tolist()
+
+                q_nouns = []
+                for rel in target['relations']:
+                    q_nouns.append(rel[0])
+                    q_nouns.append(rel[1])
+
+                q_nouns = list(set(q_nouns))
+                target['q_nouns'] = q_nouns
+
+                cost_mat = torch.zeros((pred_logits.shape[1], len(q_nouns)))
+                onehot = torch.zeros(len(q_nouns), pad_len, device=pred_logits.device)
+
+                for ii, name in enumerate(q_nouns):
+                    ids = self.tokenizer(name + '.').input_ids[1:-1] 
+                    ns, ne = search_query_pos(input_ids, ids)
+                    assert ns != ne, "cannot find query :{} from input_ids:{}".format(ids,
+                                        input_ids)
+
+                    score = pred_logits[bid, :, ns:ne].sigmoid().mean(-1)
+                    cost_mat[:, ii] = -score
+
+                    onehot[ii, ns:ne].fill_(1.0)
+
+                obj_tgt_onehot.append(onehot)
+                # linear assign
+                indice = linear_sum_assignment(cost_mat.cpu())
+
+                tmp = {}
+                for src, dst in zip(indice[0], indice[1]):
+                    tmp[q_nouns[dst]] = src
+                grounded.append(tmp)
+
+
+        # step 2 -- relation 
+        relation_feature = []
+        rel_tgt = []
+        batch_ids = []
+        for bid, target in enumerate(targets):
+            if len(target['relations']) == 0:
+                continue
+
+            for name in target['q_nouns']:
+                    obj_logits.append(padding_last(pred_logits[bid, grounded[bid][name]], pad_len))
+
+            sub_id, obj_id = [], []
+            for rel in target['relations']:
+                sub_id.append(grounded[bid][rel[0]])
+                obj_id.append(grounded[bid][rel[1]])
+                rel_tgt.append(rel[2])
+
+            sub_id = torch.as_tensor(sub_id)
+            obj_id = torch.as_tensor(obj_id)
+
+            rel_emb = torch.cat((hs_obj[bid, sub_id],
+                                 hs_obj[bid, obj_id],
+                                 hs_rln[bid].flatten().repeat(sub_id.shape[0], 1)), 1)
+
+            relation_feature.append(rel_emb)
+
+            # random sample negatives
+            n = len(target['q_nouns'])
+            full_adj = torch.ones((n, n))-torch.diag(torch.ones(n))
+            for rel in target['relations']:
+                si = target['q_nouns'].index(rel[0])
+                oi = target['q_nouns'].index(rel[1])
+                full_adj[si, oi] = 0
+            neg_edges = torch.nonzero(full_adj)
+
+            num_neg_per_img = max(1, len(target['relations']) * 3)
+            if len(neg_edges) >= num_neg_per_img:
+                idx_ = torch.randperm(neg_edges.shape[0])[:num_neg_per_img]
+                neg_edges = neg_edges[idx_,:]
+
+            neg_embs = []
+            for item in neg_edges.tolist():
+                sub_name = target['q_nouns'][item[0]]
+                obj_name = target['q_nouns'][item[1]]
+
+                neg_emb = torch.cat((
+                                    hs_obj[bid, grounded[bid][sub_name]],
+                                    hs_obj[bid, grounded[bid][obj_name]],
+                                    hs_rln[bid].flatten()
+                                    ), 0)
+                neg_embs.append(neg_emb)
+                rel_tgt.append('[UNK]')
+                                        
+            if len(neg_embs) < num_neg_per_img:
+                for rel in target['relations']:
+                    next_id = random.randint(0, len(targets)-1)
+                    rid = random.randint(0, hs_obj.shape[1]-1)
+                    if next_id != bid:
+                        next_tgt = targets[next_id]
+                        next_obj = hs_obj[next_id, rid]
+                    else: # random noise 
+                        next_obj = torch.randn_like(hs_obj[bid, rid])
+
+                    if random.randint(0, 1) == 0:
+                        neg_emb = torch.cat((hs_obj[bid, grounded[bid][rel[0]]],
+                                             next_obj, 
+                                             hs_rln[bid].flatten()), 0)
+                    else:
+                        neg_emb = torch.cat((next_obj, 
+                                             hs_obj[bid, grounded[bid][rel[1]]],
+                                             hs_rln[bid].flatten()), 0)
+
+                    neg_embs.append(neg_emb)
+                    rel_tgt.append('[UNK]')
+
+
+            neg_embs = torch.stack(neg_embs)
+            relation_feature.append(neg_embs)
+            batch_ids.extend([bid]* (len(rel_emb) + len(neg_embs)))
+
+        relation_feature = torch.cat(relation_feature, 0)
+        batch_ids = torch.as_tensor(batch_ids)
+
+        assert len(relation_feature) > 0, "No relation features !"
+
+        # shuffle 
+        idx_ = torch.randperm(relation_feature.shape[0])
+        relation_feature = self.rln_proj(relation_feature[idx_])
+        rel_tgt = [rel_tgt[e] for e in idx_.tolist()]
+        batch_ids = batch_ids[idx_]
+
+        rel_logits  = torch.einsum("a d, a b d -> a b", relation_feature, encoded_text[batch_ids])
+        rel_logits.masked_fill_(~text_mask[batch_ids], float('-inf'))
+
+        text_input_ids = rel_text_dict['input_ids']
+            
+        # loss for objects
+        obj_logits = torch.stack(obj_logits, 0)
+        obj_mask = obj_logits == float('-inf')
+        obj_tgt_onehot = torch.cat(obj_tgt_onehot, 0)
+
+        num_objs = torch.as_tensor([obj_logits.shape[0]], device=obj_logits.device)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_objs)
+        num_objs = torch.clamp(num_objs / get_world_size(), min=1).item()
+
+        alpha, gamma = 0.25, 2.0
+        if True: #with torch.no_grad():
+            loss_ce = sigmoid_focal_loss(obj_logits, obj_tgt_onehot, num_objs, 
+                                         alpha=alpha, gamma=gamma, reduction='none') * obj_logits.shape[1]
+            loss_ce.masked_fill_(obj_mask, 0.)
+
+            nb_pos = obj_tgt_onehot.sum(-1)
+            nb_pos[nb_pos == 0] = 1.0
+            loss_ce = (loss_ce / nb_pos.unsqueeze(-1)).mean(1).sum() / num_objs
+
+        losses = {'loss_ce': loss_ce}
+        # 
+        rel_tgt_onehot = torch.zeros_like(rel_logits)
+        for ii, (bid, name) in enumerate(zip(batch_ids, rel_tgt)):
+            ids = self.tokenizer(name + '.').input_ids[1:-1]
+
+            start_i, end_i = search_query_pos(text_input_ids[bid].tolist(), ids)
+            assert start_i != end_i, "cannot find query:{} from input_ids: {}".format(
+                    name, self.tokenizer.decode(text_input_ids[bid]))
+
+            rel_tgt_onehot[ii, start_i: end_i] = 1.0
+
+        rel_num = torch.as_tensor(rel_tgt_onehot.shape[0], device=rel_tgt_onehot.device) 
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(rel_num)
+        rel_num = torch.clamp(rel_num / get_world_size(), min=1).item()
+
+        alpha, gamma = 0.25, 2.0
+        eps = 1e-5 
+        rel_prob = rel_logits.sigmoid().clamp(min=eps, max=1.0-eps)
+        rel_mask = (rel_logits != float('-inf')).float()
+        
+        rel_weight = rel_tgt_onehot.sum(1, keepdim=True)
+        rel_weight[rel_weight == 0] = 1.0
+
+        pos_loss = - torch.log(rel_prob) * ((1.0 - rel_prob)** gamma) * rel_tgt_onehot * rel_mask / rel_weight
+        neg_loss = - torch.log(1.0 -rel_prob) * (rel_prob**gamma) * (1.0 - rel_tgt_onehot) * rel_mask  / rel_weight
+
+        pos_loss = pos_loss.sum() 
+        neg_loss = neg_loss.sum() 
+
+        loss = (pos_loss + neg_loss) / rel_num
+
+        losses['loss_edges'] = loss
+        with torch.no_grad():
+            losses['loss_edges_pos'] = pos_loss.detach() /  rel_num
+            losses['loss_edges_neg'] = neg_loss.detach() /  rel_num
+
+
+        return losses
+
+    def forward(self, outputs, targets, outputs_t=None, return_indices=False, 
+                global_iter=-1, use_objectness=False):
+
+        """ This performs the loss computation.
+        Parameters:
+             outputs: dict of tensors, see the output specification of the model for the format
+             targets: list of dicts, such that len(targets) == batch_size.
+                      The expected keys in each dict depends on the losses applied, see each loss' doc
+            
+             return_indices: used for vis. if True, the layer0-5 indices will be returned as well.
+
+        """
+        input_ids = outputs['input_ids']
+        for bid, target in enumerate(targets):
+            target['input_ids'] = input_ids[bid]
+
+
+        self.use_objectness = use_objectness
+        self.global_iter = global_iter
+
+
+        if False: #self.rln_pretraining:
+            input_ids = outputs['input_ids']
+            for bid, target in enumerate(targets):
+                target['input_ids'] = input_ids[bid]
+
+
+            losses = {}
+            losses.update(self.rln_set_loss(outputs, targets, outputs['rel_text_dict']))
+            if 'aux_outputs' in outputs:
+                for idx, aux_outputs in enumerate(outputs['aux_outputs']):
+                    l_dict = self.rln_set_loss(aux_outputs, targets, outputs['rel_text_dict'])
+                    l_dict = {k + f'_{idx}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+
+            #if 'enc_outputs' in outputs:
+            #    for idx, aux_outputs in enumerate(outputs['enc_outputs']):
+            #        l_dict = self.rln_set_loss(aux_outputs, targets, outputs['rel_text_dict'])
+            #        l_dict = {k + f'_enc_{i}': v for k, v in l_dict.items()}
+            #        losses.update(l_dict)
+            #if 'interm_outputs' in outputs:
+            #    l_dict = self.rln_set_loss(outputs['interm_outputs'], targets, outputs['rel_text_dict'])
+            #    l_dict = {k + f'_interm': v for k, v in l_dict.items()}
+            #    losses.update(l_dict)
+
+            return losses 
+
+
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        device=next(iter(outputs.values())).device
+
+
+        indices = self.matcher(outputs_without_aux, targets)
+        
+        if outputs_t is not None:
+            outputs_without_aux_t = {k: v for k, v in outputs_t.items() if k != 'aux_outputs'}
+            indices_t = self.matcher(outputs_without_aux_t, targets)
+        else:
+            indices_t = None
+
+        if return_indices:
+            indices0_copy = indices
+            indices_list = []
+
+        # Compute the average number of target boxes accross all nodes, for normalization purposes
+        num_boxes = sum(len(t["boxes"]) for t in targets)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=device)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_boxes)
+        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+
+        # Compute all the requested losses
+        losses = {}
+
+        # prepare for dn loss
+        dn_meta = outputs['dn_meta'] if 'dn_meta' in outputs else None 
+
+        if self.training and dn_meta and 'output_known_lbs_bboxes' in dn_meta:
+            output_known_lbs_bboxes,single_pad, scalar = self.prep_for_dn(dn_meta)
+
+            dn_pos_idx = []
+            dn_neg_idx = []
+            for i in range(len(targets)):
+                if len(targets[i]['boxes']) > 0:
+                    t = torch.arange(0, len(targets[i]['boxes']) - 1).long().cuda()
+                    t = t.unsqueeze(0).repeat(scalar, 1)
+                    tgt_idx = t.flatten()
+                    output_idx = (torch.tensor(range(scalar)) * single_pad).long().cuda().unsqueeze(1) + t
+                    output_idx = output_idx.flatten()
+                else:
+                    output_idx = tgt_idx = torch.tensor([]).long().cuda()
+
+                dn_pos_idx.append((output_idx, tgt_idx))
+                dn_neg_idx.append((output_idx + single_pad // 2, tgt_idx))
+
+            output_known_lbs_bboxes=dn_meta['output_known_lbs_bboxes']
+            l_dict = {}
+            for loss in self.losses:
+                if 'edges' == loss:
+                    continue 
+                if 'obj_likelihood' == loss:
+                    continue 
+
+                kwargs = {}
+                if 'labels' in loss:
+                    kwargs = {'log': False}
+                l_dict.update(self.get_loss(loss, output_known_lbs_bboxes, targets, dn_pos_idx, num_boxes*scalar,**kwargs))
+
+            l_dict = {k + f'_dn': v for k, v in l_dict.items()}
+            losses.update(l_dict)
+        else:
+            pass
+
+        for loss in self.losses:
+            kwargs = {}
+            if 'edges' in loss:
+                kwargs = {'object_token': outputs['hs_obj'],
+                          'relation_token': outputs['hs_rln'],
+                          'rel_text_dict': outputs.get('rel_text_dict', None),
+                          'rel_text_dict_t': outputs_t.get('rel_text_dict', None) if outputs_t is not None else None 
+                          }
+                if outputs_t is not None:
+                    kwargs['outputs_t'] = outputs_t
+                    kwargs['indices_t'] = indices_t
+
+            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes, **kwargs))
+
+        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
+        if 'aux_outputs' in outputs:
+            for idx, aux_outputs in enumerate(outputs['aux_outputs']):
+                indices = self.matcher(aux_outputs, targets)
+                if outputs_t is not None:
+                    aux_outputs_t = outputs_t['aux_outputs'][idx]
+                    indices_t = self.matcher(aux_outputs_t, targets)
+
+                if return_indices:
+                    indices_list.append(indices)
+                for loss in self.losses:
+                    if loss == 'masks':
+                        # Intermediate masks losses are too costly to compute, we ignore them.
+                        continue
+                    kwargs = {}
+                    if loss == 'labels':
+                        # Logging is enabled only for the last layer
+                        kwargs = {'log': False}
+                    if 'edges' in loss:
+                        kwargs = {'object_token': aux_outputs['hs_obj'],
+                                  'relation_token': aux_outputs['hs_rln'],
+                                  'rel_text_dict': outputs.get('rel_text_dict', None),
+                                  'rel_text_dict_t': outputs_t.get('rel_text_dict', None) if outputs_t is not None else None 
+                                 }
+                        if outputs_t is not None:
+                            kwargs['outputs_t'] = aux_outputs_t
+                            kwargs['indices_t'] = indices_t
+
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
+                    l_dict = {k + f'_{idx}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+
+                if self.training and dn_meta and 'output_known_lbs_bboxes' in dn_meta:
+                    aux_outputs_known = output_known_lbs_bboxes['aux_outputs'][idx]
+                    l_dict={}
+                    for loss in self.losses:
+                        if 'edges' == loss:
+                            continue 
+
+                        kwargs = {}
+                        if 'labels' in loss:
+                            kwargs = {'log': False}
+
+                        l_dict.update(self.get_loss(loss, aux_outputs_known, targets, dn_pos_idx, num_boxes*scalar,
+                                                                 **kwargs))
+
+                    l_dict = {k + f'_dn_{idx}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+                else:
+                    pass
+
+        # interm_outputs loss
+        if 'interm_outputs' in outputs:
+            interm_outputs = outputs['interm_outputs']
+            indices = self.matcher(interm_outputs, targets)
+
+            if outputs_t is not None:
+                interm_outputs_t = outputs_t['interm_outputs']
+                indices_t = self.matcher(interm_outputs_t, targets)
+
+            if return_indices:
+                indices_list.append(indices)
+            for loss in self.losses:
+                if loss == 'masks':
+                    # Intermediate masks losses are too costly to compute, we ignore them.
+                    continue
+                if 'obj_likelihood' == loss:
+                    continue 
+                kwargs = {}
+                if loss == 'labels':
+                    # Logging is enabled only for the last layer
+                    kwargs = {'log': False}
+
+                if 'edges' in loss:
+                    kwargs = {'object_token': interm_outputs['hs_obj'],
+                              'relation_token': interm_outputs['hs_rln'],
+                              'rel_text_dict': outputs.get('rel_text_dict', None), 
+                              'rel_text_dict_t': outputs_t.get('rel_text_dict', None) if outputs_t is not None else None 
+                             }
+                    if outputs_t is not None:
+                        kwargs['outputs_t'] = interm_outputs_t
+                        kwargs['indices_t'] = indices_t
+
+                l_dict = self.get_loss(loss, interm_outputs, targets, indices, num_boxes, **kwargs)
+                l_dict = {k + f'_interm': v for k, v in l_dict.items()}
+                losses.update(l_dict)
+
+        # enc output loss
+        if 'enc_outputs' in outputs:
+            for i, enc_outputs in enumerate(outputs['enc_outputs']):
+                indices = self.matcher(enc_outputs, targets)
+                if return_indices:
+                    indices_list.append(indices)
+                for loss in self.losses:
+                    if loss == 'masks':
+                        # Intermediate masks losses are too costly to compute, we ignore them.
+                        continue
+                    if 'obj_likelihood' == loss:
+                        continue 
+                    kwargs = {}
+                    if loss == 'labels':
+                        # Logging is enabled only for the last layer
+                        kwargs = {'log': False}
+                    if 'edges' == loss:
+                        continue 
+
+                    l_dict = self.get_loss(loss, enc_outputs, targets, indices, num_boxes, **kwargs)
+                    l_dict = {k + f'_enc_{i}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+
+        if return_indices:
+            indices_list.append(indices0_copy)
+            return losses, indices_list
+
+        return losses
+
+    def prep_for_dn(self,dn_meta):
+        output_known_lbs_bboxes = dn_meta['output_known_lbs_bboxes']
+        num_dn_groups,pad_size=dn_meta['num_dn_group'],dn_meta['pad_size']
+        assert pad_size % num_dn_groups==0
+        single_pad=pad_size//num_dn_groups
+
+        return output_known_lbs_bboxes,single_pad,num_dn_groups

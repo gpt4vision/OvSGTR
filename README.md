@@ -70,9 +70,9 @@ Notice that the actual batch size = batch size (default 4 in config files) * num
     </tr>
     <tr>
       <td>Swin-B</td>
-      <td>  </td>
+      <td> 27.75 / 36.44 / 42.35 </td>
       <td><a href="">link</a>
-      <td> </td>
+      <td>config/GroundingDINO_SwinB_full.py </td>
     </tr>
   </tbody>
 </table> 
