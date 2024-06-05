@@ -24,7 +24,7 @@ black_lists = set(['we', 'me',  'i', 'you', 'u', 'he', 'she', 'them', 'her', 'hi
 DEBUG = True #if os.environ.get("DEBUG") == '1' else False 
 
 CAPTION_FILE = "./data/coco/annotations/captions_train2017.json"
-DST_FILE = "./data/coco/annotations/coco_sg_triplets.json_debug"
+DST_FILE = "./data/coco/annotations/captions_train2017_triple.json"
 
 #CAPTION_FILE = sys.argv[1]
 #DST_FILE = sys.argv[2]

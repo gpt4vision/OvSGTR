@@ -34,7 +34,8 @@ wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alp
 - VG150
 - COCO
 ```
-prepare the dataset under the folder ```data``` with the [instruction](data/data.md)
+prepare the dataset under the folder ```data``` with the [instruction](datasets/data.md)
+
 
 ## Closed-set SGG
 For training OvSGTR (w. Swin-T) on VG150, running with this command 
@@ -107,7 +108,8 @@ For PREDCLS, please set ```use_gt_box=True``` when calling inference scripts.
   <thead>
     <tr style="text-align: right;">
       <th>backbone</th>
-      <th>R@20/50/100</th>
+      <th>R@20/50/100 (Base+Novel)</th>
+      <th>R@20/50/100 (Novel)</th>
       <th>Checkpoint</th>
       <th>Config</th>
     </tr>
@@ -116,12 +118,14 @@ For PREDCLS, please set ```use_gt_box=True``` when calling inference scripts.
     <tr>
       <td>Swin-T</td>
       <td> 12.34 / 18.14 / 23.20 </td>
+      <td> 6.90 / 12.06 / 16.49 </td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovd-swint.pth">link</a></td>
       <td>config/GroundingDINO_SwinT_OGC_ovd.py</td>
     </tr>
     <tr>
       <td>Swin-B</td>
       <td>  15.43 / 21.35 / 26.22 </td>
+      <td>  10.21 / 15.58 / 19.96 </td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovd-swinb.pth">link</a>
       <td>config/GroundingDINO_SwinB_ovd.py</td>
     </tr>
@@ -138,7 +142,8 @@ Base object categories ```VG150_BASE_PREDICATE``` and novel object categories ``
   <thead>
     <tr style="text-align: right;">
       <th>backbone</th>
-      <th>R@20/50/100</th>
+      <th>R@20/50/100 (Base+Novel)</th>
+      <th>R@20/50/100 (Novel)</th>
       <th>Checkpoint</th>
       <th>Config</th>
       <th>Pre-trained checkpoint </th>
@@ -148,7 +153,8 @@ Base object categories ```VG150_BASE_PREDICATE``` and novel object categories ``
   <tbody>
     <tr>
       <td>Swin-T</td>
-      <td>   </td>
+      <td>  15.85 / 20.50 / 23.90 </td>
+      <td>  10.17 / 13.47 / 16.20 </td> 
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovr-swint.pth">link</a></td>
       <td>config/GroundingDINO_SwinT_OGC_ovr.py</td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-pretrain-coco-swint.pth"><s>link</s></a></td>
@@ -156,7 +162,8 @@ Base object categories ```VG150_BASE_PREDICATE``` and novel object categories ``
     </tr>
     <tr>
       <td>Swin-B</td>
-      <td>    </td>
+      <td>  17.63 / 22.90 / 26.68  </td>
+      <td>  12.09 / 16.37 / 19.73  </td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovr-swinb.pth">link</a>
       <td>config/GroundingDINO_SwinB_ovr.py</td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-pretrain-coco-swinb.pth">link</a>
@@ -164,7 +171,7 @@ Base object categories ```VG150_BASE_PREDICATE``` and novel object categories ``
     </tr>
   </tbody>
 </table> 
-If you want to traint it again, you need to do pre-training on COCO using pre-trained config files (:cry: some checkpoints were deleted when I cleaned the disk).
+If you want to traint it again, you need to do pre-training on COCO using pre-trained config files (😢 some checkpoints were deleted when I cleaned the disk).
 
 
 ## OvD+R-SGG
@@ -175,7 +182,9 @@ For OvD+R-SGG mode, set both ```sg_ovd_mode = True``` and ```sg_ovr_mode = True`
   <thead>
     <tr style="text-align: right;">
       <th>backbone</th>
-      <th>R@20/50/100</th>
+      <th>R@20/50/100 (Joint)</th>
+      <th>R@20/50/100 (Novel Object)</th>
+      <th>R@20/50/100 (Novel Relation)</th>
       <th>Checkpoint</th>
       <th>Config</th>
       <th>Pre-trained checkpoint </th>
@@ -185,7 +194,9 @@ For OvD+R-SGG mode, set both ```sg_ovd_mode = True``` and ```sg_ovr_mode = True`
   <tbody>
     <tr>
       <td>Swin-T</td>
-      <td>   </td>
+      <td> 10.02 / 13.50 / 16.37  </td>
+      <td> 10.56 / 14.32 / 17.48  </td>
+      <td>  7.09 / 9.19 / 11.18 </td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovdr-swint.pth">link</a></td>
       <td>config/GroundingDINO_SwinT_OGC_ovdr.py</td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-pretrain-coco-swint.pth"><s>link</s></a></td>
@@ -193,7 +204,9 @@ For OvD+R-SGG mode, set both ```sg_ovd_mode = True``` and ```sg_ovr_mode = True`
     </tr>
     <tr>
       <td>Swin-B</td>
-      <td>    </td>
+      <td>   </td>
+      <td>   </td>
+      <td>   </td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovdr-swinb.pth">link</a>
       <td>config/GroundingDINO_SwinB_ovdr.py</td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-pretrain-coco-swinb.pth">link</a>

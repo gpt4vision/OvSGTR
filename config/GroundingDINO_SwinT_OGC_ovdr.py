@@ -114,7 +114,7 @@ use_distill=True
 
 
 
-teacher_weight="./logs/sgg/vg-pre-wounk/checkpoint0008.pth"
+#teacher_weight="./logs/sgg/vg-pre-wounk/checkpoint0008.pth"
 
 unsupervised_distill=True
 distill_loss_coef = 0.1 
