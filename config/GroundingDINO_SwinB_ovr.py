@@ -112,4 +112,4 @@ use_distill = True
 unsupervised_distill=True
 distill_loss_coef = 0.1 
 
-
+teacher_weight='checkpoints/vg-pretrain-coco-swinb.pth'

@@ -108,8 +108,9 @@ focal_loss_for_edges = True
 
 
 detections_per_img = 100
-use_distill = False #True
-unsupervised_distill=False #True
+use_distill = True
+unsupervised_distill=True
 distill_loss_coef = 0.1 
 
 
+teacher_weight='checkpoints/vg-pretrain-coco-swinb.pth'

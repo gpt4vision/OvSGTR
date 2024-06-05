@@ -2,7 +2,7 @@
 Official Implementation of "Expanding Scene Graph Boundaries: Fully Open-vocabulary Scene Graph Generation via Visual-Concept Alignment and Retention" (
     [Paper](https://arxiv.org/pdf/2311.10988)
 )
-
+![OvSGG](figures/OvSGG.png)
 ![OvSGTR](figures/OvSGTR.png)
 
 ## Setup
@@ -94,7 +94,7 @@ with multiple GPUs (there is a slight difference of the result output by DINO_ev
 </table> 
 
 ## OvD-SGG 
-for OvD-SGG mode, set ```sg_ovd_mode = True``` in the config file. 
+for OvD-SGG mode, set ```sg_ovd_mode = True``` in the config file (e.g., config/GroundingDINO_SwinT_OGC_ovd.py). 
 Following "Towards Open-vocabulary Scene Graph Generation with Prompt-based Finetuning" and [VS3](https://github.com/zyong812/VS3_CVPR23), we split the VG150 into two parts, i.e., 
 base objects ```VG150_BASE_OBJ_CATEGORIES```, and novel objects in ```VG150_NOVEL2BASE```.
 For PREDCLS, please set ```use_gt_box=True``` when calling inference scripts. 
@@ -116,21 +116,91 @@ For PREDCLS, please set ```use_gt_box=True``` when calling inference scripts.
     <tr>
       <td>Swin-T</td>
       <td> 12.34 / 18.14 / 23.20 </td>
-      <td><a href="">link</a></td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovd-swint.pth">link</a></td>
       <td>config/GroundingDINO_SwinT_OGC_ovd.py</td>
     </tr>
     <tr>
       <td>Swin-B</td>
       <td>  15.43 / 21.35 / 26.22 </td>
-      <td><a href="">link</a>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovd-swinb.pth">link</a>
       <td>config/GroundingDINO_SwinB_ovd.py</td>
     </tr>
   </tbody>
 </table> 
 
 ## OvR-SGG
+for OvR-SGG mode, set ```sg_ovr_mode = True``` in the config file (e.g., config/GroundingDINO_SwinT_OGC_ovr.py). 
+Base object categories ```VG150_BASE_PREDICATE``` and novel object categories ```VG150_NOVEL_PREDICATE``` can be found in the ```datasets/vg.py```.
+
+### Checkpoints
+<!-- insert a table -->
+<table>
+  <thead>
+    <tr style="text-align: right;">
+      <th>backbone</th>
+      <th>R@20/50/100</th>
+      <th>Checkpoint</th>
+      <th>Config</th>
+      <th>Pre-trained checkpoint </th>
+      <th>Pre-trained config </th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Swin-T</td>
+      <td>   </td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovr-swint.pth">link</a></td>
+      <td>config/GroundingDINO_SwinT_OGC_ovr.py</td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-pretrain-coco-swint.pth"><s>link</s></a></td>
+      <td>config/GroundingDINO_SwinT_OGC_pretrain.py</td> 
+    </tr>
+    <tr>
+      <td>Swin-B</td>
+      <td>    </td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovr-swinb.pth">link</a>
+      <td>config/GroundingDINO_SwinB_ovr.py</td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-pretrain-coco-swinb.pth">link</a>
+      <td>config/GroundingDINO_SwinB_pretrain.py</td>
+    </tr>
+  </tbody>
+</table> 
+If you want to traint it again, you need to do pre-training on COCO using pre-trained config files (:cry: some checkpoints were deleted when I cleaned the disk).
+
 
 ## OvD+R-SGG
+For OvD+R-SGG mode, set both ```sg_ovd_mode = True``` and ```sg_ovr_mode = True``` (e.g., config/GroundingDINO_SwinT_OGC_ovdr.py)
+### Checkpoints
+<!-- insert a table -->
+<table>
+  <thead>
+    <tr style="text-align: right;">
+      <th>backbone</th>
+      <th>R@20/50/100</th>
+      <th>Checkpoint</th>
+      <th>Config</th>
+      <th>Pre-trained checkpoint </th>
+      <th>Pre-trained config </th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Swin-T</td>
+      <td>   </td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovdr-swint.pth">link</a></td>
+      <td>config/GroundingDINO_SwinT_OGC_ovdr.py</td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-pretrain-coco-swint.pth"><s>link</s></a></td>
+      <td>config/GroundingDINO_SwinT_OGC_pretrain.py</td> 
+    </tr>
+    <tr>
+      <td>Swin-B</td>
+      <td>    </td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovdr-swinb.pth">link</a>
+      <td>config/GroundingDINO_SwinB_ovdr.py</td>
+      <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-pretrain-coco-swinb.pth">link</a>
+      <td>config/GroundingDINO_SwinB_pretrain.py</td>
+    </tr>
+  </tbody>
+</table> 
 
 
 
