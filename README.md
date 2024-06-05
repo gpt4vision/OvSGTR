@@ -204,9 +204,9 @@ For OvD+R-SGG mode, set both ```sg_ovd_mode = True``` and ```sg_ovr_mode = True`
     </tr>
     <tr>
       <td>Swin-B</td>
-      <td>   </td>
-      <td>   </td>
-      <td>   </td>
+      <td> 12.37 / 17.14 / 21.03  </td>
+      <td> 12.63 / 17.58 / 21.70  </td>
+      <td> 10.56 / 14.62 / 18.22  </td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-ovdr-swinb.pth">link</a>
       <td>config/GroundingDINO_SwinB_ovdr.py</td>
       <td><a href="https://huggingface.co/JosephZ/OvSGTR/blob/main/vg-pretrain-coco-swinb.pth">link</a>
