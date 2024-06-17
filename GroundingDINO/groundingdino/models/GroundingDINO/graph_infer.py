@@ -33,7 +33,7 @@ def graph_infer(outputs : List[Dict],
         scores = copy.deepcopy(output['scores']) # (#obj)
         labels = copy.deepcopy(output['labels']) # (#obj)
 
-        node_id = torch.nonzero(labels).squeeze()
+        node_id = torch.nonzero(labels).squeeze(-1) # fix: #obj==1
 
         obj_token = obj_token[node_id]
         pred_classes = labels[node_id]
@@ -44,7 +44,7 @@ def graph_infer(outputs : List[Dict],
         pred_boxes_class = pred_classes
 
 
-        if node_id.dim() !=0 and node_id.nelement() != 0 and node_id.shape[0]>1:
+        if node_id.nelement() != 0:
             # all possible node pairs in all token ordering
             tmp = torch.arange(len(node_id))
             node_pairs = torch.cat((torch.combinations(tmp),
