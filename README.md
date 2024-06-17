@@ -171,7 +171,6 @@ Base object categories ```VG150_BASE_PREDICATE``` and novel object categories ``
     </tr>
   </tbody>
 </table> 
-If you want to traint it again, you need to do pre-training on COCO using pre-trained config files (😢 some checkpoints were deleted when I cleaned the disk).
 
 
 ## OvD+R-SGG
