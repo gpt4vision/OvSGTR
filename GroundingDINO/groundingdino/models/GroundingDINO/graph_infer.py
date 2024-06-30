@@ -33,7 +33,7 @@ def graph_infer(outputs : List[Dict],
         scores = copy.deepcopy(output['scores']) # (#obj)
         labels = copy.deepcopy(output['labels']) # (#obj)
 
-        node_id = torch.nonzero(labels).squeeze(-1) # fix: #obj==1
+        node_id = torch.nonzero(labels).squeeze() 
 
         obj_token = obj_token[node_id]
         pred_classes = labels[node_id]
@@ -44,7 +44,7 @@ def graph_infer(outputs : List[Dict],
         pred_boxes_class = pred_classes
 
 
-        if node_id.nelement() != 0:
+        if node_id.dim() !=0 and node_id.nelement() != 0 and node_id.shape[0]>1:
             # all possible node pairs in all token ordering
             tmp = torch.arange(len(node_id))
             node_pairs = torch.cat((torch.combinations(tmp),
@@ -55,11 +55,11 @@ def graph_infer(outputs : List[Dict],
 
             # feature
             relation_feat = torch.cat((
-                                       obj_token[node_pairs[:, 0], :],
-                                       obj_token[node_pairs[:, 1], :],
-                                       rln_token.flatten().repeat(len(node_pairs), 1), 
-                                       ),
-                                       dim=1)
+                                           obj_token[node_pairs[:, 0], :],
+                                           obj_token[node_pairs[:, 1], :],
+                                           rln_token.flatten().repeat(len(node_pairs), 1), 
+                                           ),
+                                           dim=1)
             relation_feat = rln_proj(relation_feat)
 
             if use_classifier:
@@ -107,10 +107,16 @@ def graph_infer(outputs : List[Dict],
             all_node_pairs = all_node_pairs[rel_idx]
 
         else:
-            all_node_pairs = None 
-            all_relation = None 
+            assert node_id.nelement() == 1, "#obj != 1"
+
+            print("Warning: #obj==1!")
+            all_node_pairs = torch.zeros(1, 2).long()
+            all_relation = torch.zeros(1, 51) # 
             relation_feat = None
-            import pdb; pdb.set_trace() #TODO 
+            pred_boxes = pred_boxes.view(1, -1).repeat(2, 1)
+            pred_boxes_score = pred_boxes_score.view(1, -1).repeat(2, 1)
+            pred_boxes_class = pred_boxes_class.view(1, -1).repeat(2, 1)
+            #pred_boxes_score.fill_(0.)
 
         out = {}
         if all_relation is not None:
