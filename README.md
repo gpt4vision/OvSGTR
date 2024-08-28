@@ -1,4 +1,4 @@
-# [ECCV24 Accepted] OvSGTR
+# [ECCV24] OvSGTR
 Official Implementation of "Expanding Scene Graph Boundaries: Fully Open-vocabulary Scene Graph Generation via Visual-Concept Alignment and Retention" (
     [Paper](https://arxiv.org/pdf/2311.10988)
 )
