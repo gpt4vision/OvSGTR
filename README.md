@@ -223,10 +223,10 @@ Thank [Scene-Graph-Benchmark.pytorch](https://github.com/KaihuaTang/Scene-Graph-
 ## Citation
 Please cite OvSGTR in your publications if it helps your research:
 ```
-@article{chen2023expanding,
+@inproceedings{chen2024expanding,
   title={Expanding Scene Graph Boundaries: Fully Open-vocabulary Scene Graph Generation via Visual-Concept Alignment and Retention},
   author={Chen, Zuyao and Wu, Jinlin and Lei, Zhen and Zhang, Zhaoxiang and Chen, Changwen},
-  journal={arXiv preprint arXiv:2311.10988},
-  year={2023}
+  booktitle={European Conference on Computer Vision},
+  year={2024}
 }
 ```
