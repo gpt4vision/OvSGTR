@@ -1,4 +1,4 @@
-# [ECCV 2024 Best Paper Candidate] OvSGTR
+# Expanding Scene Graph Boundaries: Fully Open-vocabulary Scene Graph Generation via Visual-Concept Alignment and Retention
 Official Implementation of "Expanding Scene Graph Boundaries: Fully Open-vocabulary Scene Graph Generation via Visual-Concept Alignment and Retention" (
     [Paper](https://arxiv.org/pdf/2311.10988)
 )
