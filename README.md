@@ -226,7 +226,8 @@ Please cite OvSGTR in your publications if it helps your research:
 @inproceedings{chen2024expanding,
   title={Expanding Scene Graph Boundaries: Fully Open-vocabulary Scene Graph Generation via Visual-Concept Alignment and Retention},
   author={Chen, Zuyao and Wu, Jinlin and Lei, Zhen and Zhang, Zhaoxiang and Chen, Changwen},
-  booktitle={European Conference on Computer Vision},
+  booktitle={European Conference on Computer Vision (ECCV)},
+  pages={108--124},
   year={2024}
 }
 ```
